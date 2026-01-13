@@ -1,11 +1,10 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
-import L from 'leaflet';
-import 'leaflet/dist/leaflet.css';
-import { Button } from '@/components/ui/button';
-import { MapPin, Clock, RefreshCw, Plus, AlertTriangle } from 'lucide-react';
-import { collection, query, where, getDocs, addDoc, serverTimestamp, Timestamp, orderBy } from 'firebase/firestore';
-import { geohashForLocation, geohashQueryBounds } from 'geofire-common';
-import { db, initError } from '@/lib/firebase';
+import { useEffect, useRef, useState, useCallback } from "react";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
+import { Button } from "@/components/ui/button";
+import { MapPin, Clock, RefreshCw, Plus, AlertTriangle } from "lucide-react";
+import { ref, get, push } from "firebase/database";
+import { rtdb, initError } from "@/lib/firebase";
 
 interface Hotspot {
   lat: number;
@@ -13,19 +12,41 @@ interface Hotspot {
   count: number;
 }
 
-interface EventDoc {
-  id: string;
-  lat: number;
-  lng: number;
-  ts: Timestamp;
-  geohash: string;
+type TimeFilter = "today" | "hour";
+
+type RtdbEvent = {
+  lat?: number;
+  lng?: number;
+  lon?: number;
+  time?: string; // e.g. "2026-01-13 12:44:32"
+  ts?: number; // optional millis
+};
+
+function normalizeLng(lng: number) {
+  return ((lng + 180) % 360 + 360) % 360 - 180;
+}
+function clampLat(lat: number) {
+  return Math.max(-90, Math.min(90, lat));
+}
+function fixCoords(lat: number, lng: number) {
+  return { lat: clampLat(lat), lng: normalizeLng(lng) };
+}
+
+function parseTimeToDate(value: unknown): Date | null {
+  if (typeof value === "number" && Number.isFinite(value)) return new Date(value);
+  if (typeof value !== "string") return null;
+
+  // supports "YYYY-MM-DD HH:mm:ss" and ISO strings
+  const s = value.includes("T") ? value : value.replace(" ", "T");
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 
 function getHotspotColor(count: number): string {
-  if (count >= 31) return '#ef4444';
-  if (count >= 11) return '#f97316';
-  if (count >= 4) return '#eab308';
-  return '#22c55e';
+  if (count >= 31) return "#ef4444";
+  if (count >= 11) return "#f97316";
+  if (count >= 4) return "#eab308";
+  return "#22c55e";
 }
 
 function getHotspotRadius(count: number, zoom: number): number {
@@ -38,136 +59,141 @@ function getGridSize(zoom: number): number {
   return 0.01;
 }
 
-function aggregateToHotspots(events: EventDoc[], zoom: number): Hotspot[] {
+function aggregateToHotspots(
+  points: Array<{ lat: number; lng: number }>,
+  zoom: number
+): Hotspot[] {
   const gridSize = getGridSize(zoom);
-  const cells: Map<string, { totalLat: number; totalLng: number; count: number }> = new Map();
+  const cells: Map<string, { totalLat: number; totalLng: number; count: number }> =
+    new Map();
 
-  for (const event of events) {
-    const cellX = Math.floor(event.lng / gridSize);
-    const cellY = Math.floor(event.lat / gridSize);
+  for (const p of points) {
+    const cellX = Math.floor(p.lng / gridSize);
+    const cellY = Math.floor(p.lat / gridSize);
     const key = `${cellX},${cellY}`;
 
     const cell = cells.get(key);
     if (cell) {
-      cell.totalLat += event.lat;
-      cell.totalLng += event.lng;
+      cell.totalLat += p.lat;
+      cell.totalLng += p.lng;
       cell.count += 1;
     } else {
-      cells.set(key, { totalLat: event.lat, totalLng: event.lng, count: 1 });
+      cells.set(key, { totalLat: p.lat, totalLng: p.lng, count: 1 });
     }
   }
 
-  return Array.from(cells.values()).map(cell => ({
-    lat: cell.totalLat / cell.count,
-    lng: cell.totalLng / cell.count,
-    count: cell.count,
+  return Array.from(cells.values()).map((c) => ({
+    lat: c.totalLat / c.count,
+    lng: c.totalLng / c.count,
+    count: c.count,
   }));
 }
+
+// ✅ demo fixed point (change if you want)
+const DEMO_POINT = { lat: 21.492562427776477, lng: 39.242159744145006 };
+
 
 export default function HotspotMap() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const hotspotsLayerRef = useRef<L.LayerGroup | null>(null);
-  
+
   const [hotspots, setHotspots] = useState<Hotspot[]>([]);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [timeFilter, setTimeFilter] = useState<'today' | 'hour'>('today');
+  const [timeFilter, setTimeFilter] = useState<TimeFilter>("today");
   const [isLoading, setIsLoading] = useState(false);
   const [isAdding, setIsAdding] = useState(false);
   const [error, setError] = useState<string | null>(initError);
-  const seenIdsRef = useRef<Set<string>>(new Set());
 
   const fetchEvents = useCallback(async () => {
-    if (!mapRef.current || !db) {
-      setError(initError || 'Firebase not initialized');
+    if (!mapRef.current) return;
+
+    if (!rtdb) {
+      setError(initError || "Firebase RTDB not initialized");
       return;
     }
 
     setIsLoading(true);
 
     try {
-      const bounds = mapRef.current.getBounds();
       const zoom = mapRef.current.getZoom();
-      const center: [number, number] = [
-        (bounds.getNorth() + bounds.getSouth()) / 2,
-        (bounds.getEast() + bounds.getWest()) / 2,
-      ];
-
-      const latDiff = bounds.getNorth() - bounds.getSouth();
-      const lngDiff = bounds.getEast() - bounds.getWest();
-      const radiusKm = Math.max(latDiff, lngDiff) * 111 / 2;
-      const radiusM = radiusKm * 1000;
 
       const now = new Date();
-      const startTime = timeFilter === 'today'
-        ? new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0)
-        : new Date(now.getTime() - 60 * 60 * 1000);
+      const startTime =
+        timeFilter === "today"
+          ? new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0)
+          : new Date(now.getTime() - 60 * 60 * 1000);
 
-      const queryBounds = geohashQueryBounds(center, radiusM);
-      seenIdsRef.current.clear();
-      const allEvents: EventDoc[] = [];
+      // Read all events from RTDB: /events
+      const snap = await get(ref(rtdb, "events"));
+      const val = snap.val() as Record<string, RtdbEvent> | null;
 
-      for (const b of queryBounds) {
-        const q = query(
-          collection(db, 'events'),
-          orderBy('geohash'),
-          where('geohash', '>=', b[0]),
-          where('geohash', '<=', b[1])
-        );
+      const points: Array<{ lat: number; lng: number }> = [];
 
-        const snapshot = await getDocs(q);
+      if (val) {
+        for (const [, data] of Object.entries(val)) {
+          // time filter (supports time string OR ts millis)
+          const eventDate =
+            parseTimeToDate(data.ts) || parseTimeToDate(data.time);
 
-        for (const doc of snapshot.docs) {
-          if (seenIdsRef.current.has(doc.id)) continue;
-          seenIdsRef.current.add(doc.id);
+          if (!eventDate || eventDate < startTime) continue;
 
-          const data = doc.data();
-          const lat = data.lat as number;
-          const lng = data.lng as number;
-          const ts = data.ts as Timestamp;
+          // If you want to USE incoming coords, use these:
+          const rawLat = Number(data.lat);
+          const rawLng = Number((data as any).lng ?? (data as any).lon);
 
-          if (!ts || ts.toDate() < startTime) continue;
-          if (lat < bounds.getSouth() || lat > bounds.getNorth() ||
-              lng < bounds.getWest() || lng > bounds.getEast()) continue;
+          // If coords are missing/invalid, skip
+          const hasCoords = Number.isFinite(rawLat) && Number.isFinite(rawLng);
 
-          allEvents.push({ id: doc.id, lat, lng, ts, geohash: data.geohash });
+          // ✅ You said for demo you can hardwire the spot:
+          const used = fixCoords(
+            DEMO_POINT.lat,
+            DEMO_POINT.lng
+          );
+
+          // If you want real coords later, swap to:
+          // const used = hasCoords ? fixCoords(rawLat, rawLng) : fixCoords(DEMO_POINT.lat, DEMO_POINT.lng);
+
+          // Add point
+          points.push({ lat: used.lat, lng: used.lng });
+
+          // (Optional) If you prefer: skip records that have no coords at all
+          // if (!hasCoords) continue;
         }
       }
 
-      const aggregated = aggregateToHotspots(allEvents, zoom);
+      const aggregated = aggregateToHotspots(points, zoom);
       setHotspots(aggregated);
       setLastUpdated(new Date());
       setError(null);
     } catch (err) {
-      console.error('Error fetching events:', err);
-      setError(err instanceof Error ? err.message : 'Unknown error');
+      console.error("Error fetching RTDB events:", err);
+      setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
       setIsLoading(false);
     }
   }, [timeFilter]);
 
   const addTestEvent = useCallback(async () => {
-    if (!mapRef.current || !db || isAdding) return;
+    if (!rtdb || isAdding) return;
 
     setIsAdding(true);
     try {
-      const center = mapRef.current.getCenter();
-      const jitterLat = (Math.random() - 0.5) * 0.01;
-      const jitterLng = (Math.random() - 0.5) * 0.01;
-      const lat = center.lat + jitterLat;
-      const lng = center.lng + jitterLng;
-      const geohash = geohashForLocation([lat, lng], 7);
+      const fixed = fixCoords(DEMO_POINT.lat, DEMO_POINT.lng);
 
-      await addDoc(collection(db, 'events'), {
-        lat,
-        lng,
-        geohash,
-        ts: serverTimestamp(),
+      // Push to /events (RTDB)
+      await push(ref(rtdb, "events"), {
+        lat: fixed.lat,
+        lon: fixed.lng, // matches your ESP field name
+        time: new Date().toISOString().slice(0, 19).replace("T", " "),
+        ts: Date.now(),
+        source: "web-test",
       });
 
-      setTimeout(fetchEvents, 500);
+      setTimeout(fetchEvents, 300);
     } catch (err) {
-      console.error('Failed to add test event:', err);
+      console.error("Failed to add RTDB test event:", err);
+      setError(err instanceof Error ? err.message : "Failed to add test event");
     } finally {
       setIsAdding(false);
     }
@@ -177,30 +203,44 @@ export default function HotspotMap() {
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
 
+    // Restore last view (nice UX)
+    const saved = localStorage.getItem("mapView");
+    const defaultView = saved
+      ? (JSON.parse(saved) as { center: [number, number]; zoom: number })
+      : { center: [DEMO_POINT.lat, DEMO_POINT.lng] as [number, number], zoom: 12 };
+
     const map = L.map(mapContainerRef.current, {
-      center: [40.7128, -74.006],
-      zoom: 12,
+      center: defaultView.center,
+      zoom: defaultView.zoom,
       zoomControl: true,
+      worldCopyJump: true,
     });
 
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution:
+        '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
     }).addTo(map);
 
     hotspotsLayerRef.current = L.layerGroup().addTo(map);
 
     let debounceTimeout: ReturnType<typeof setTimeout> | null = null;
     const handleMapMove = () => {
+      // save view
+      const c = map.getCenter();
+      localStorage.setItem(
+        "mapView",
+        JSON.stringify({ center: [c.lat, c.lng], zoom: map.getZoom() })
+      );
+
       if (debounceTimeout) clearTimeout(debounceTimeout);
-      debounceTimeout = setTimeout(() => {
-        if (mapRef.current) fetchEvents();
-      }, 250);
+      debounceTimeout = setTimeout(() => fetchEvents(), 250);
     };
 
-    map.on('moveend', handleMapMove);
-    map.on('zoomend', handleMapMove);
+    map.on("moveend", handleMapMove);
+    map.on("zoomend", handleMapMove);
 
     mapRef.current = map;
+
     setTimeout(fetchEvents, 100);
 
     return () => {
@@ -243,7 +283,7 @@ export default function HotspotMap() {
   }, [timeFilter, fetchEvents]);
 
   const formatTime = (date: Date | null) => {
-    if (!date) return '--:--:--';
+    if (!date) return "--:--:--";
     return date.toLocaleTimeString();
   };
 
@@ -263,9 +303,9 @@ export default function HotspotMap() {
               <div className="flex items-start gap-2 text-sm">
                 <AlertTriangle className="w-4 h-4 text-destructive mt-0.5 shrink-0" />
                 <div>
-                  <p className="font-medium text-destructive">Firebase not configured</p>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Edit src/lib/firebase.ts with your config.
+                  <p className="font-medium text-destructive">Error</p>
+                  <p className="text-xs text-muted-foreground mt-1 break-words">
+                    {error}
                   </p>
                 </div>
               </div>
@@ -274,31 +314,31 @@ export default function HotspotMap() {
 
           <div className="flex gap-2 mb-3">
             <Button
-              variant={timeFilter === 'today' ? 'default' : 'outline'}
+              variant={timeFilter === "today" ? "default" : "outline"}
               size="sm"
-              onClick={() => setTimeFilter('today')}
+              onClick={() => setTimeFilter("today")}
               className="flex-1"
             >
               Today
             </Button>
             <Button
-              variant={timeFilter === 'hour' ? 'default' : 'outline'}
+              variant={timeFilter === "hour" ? "default" : "outline"}
               size="sm"
-              onClick={() => setTimeFilter('hour')}
+              onClick={() => setTimeFilter("hour")}
               className="flex-1"
             >
               Last Hour
             </Button>
           </div>
 
-          <Button 
-            disabled={!!error || isAdding} 
+          <Button
+            disabled={!!error || isAdding}
             onClick={addTestEvent}
-            className="w-full" 
+            className="w-full"
             variant="secondary"
           >
             <Plus className="w-4 h-4 mr-2" />
-            {isAdding ? 'Adding...' : 'Add Test Event'}
+            {isAdding ? "Adding..." : "Add Test Event"}
           </Button>
         </div>
 
@@ -309,12 +349,14 @@ export default function HotspotMap() {
             {isLoading && <RefreshCw className="w-3 h-3 animate-spin ml-auto" />}
           </div>
           <div className="text-xs text-muted-foreground mt-1">
-            {hotspots.length} hotspot{hotspots.length !== 1 ? 's' : ''} visible
+            {hotspots.length} hotspot{hotspots.length !== 1 ? "s" : ""} visible
           </div>
         </div>
 
         <div className="bg-card/95 backdrop-blur-sm border border-border rounded-xl px-4 py-3 shadow-lg">
-          <div className="text-xs font-medium text-muted-foreground mb-2">Legend</div>
+          <div className="text-xs font-medium text-muted-foreground mb-2">
+            Legend
+          </div>
           <div className="flex flex-col gap-1.5 text-xs">
             <div className="flex items-center gap-2">
               <div className="w-3 h-3 rounded-full bg-green-500" />

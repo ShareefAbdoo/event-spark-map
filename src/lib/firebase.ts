@@ -1,35 +1,20 @@
-import { initializeApp, FirebaseApp } from 'firebase/app';
-import { getFirestore, Firestore } from 'firebase/firestore';
+import { initializeApp, getApps } from "firebase/app";
+import { getFirestore } from "firebase/firestore";
+import { getDatabase } from "firebase/database";
 
-// ============================================
-// PASTE YOUR FIREBASE CONFIG HERE
-// Get it from Firebase Console > Project Settings > Your apps > Config
-// ============================================
 const firebaseConfig = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
-  projectId: "YOUR_PROJECT_ID",
-  storageBucket: "YOUR_PROJECT_ID.appspot.com",
-  messagingSenderId: "YOUR_SENDER_ID",
-  appId: "YOUR_APP_ID"
+apiKey: "AIzaSyANWQVxTJCoz0AVz1djCaVfvsRkmFEGMUc",
+authDomain: "motorcyclesaver.firebaseapp.com",
+databaseURL: "https://motorcyclesaver-default-rtdb.firebaseio.com",
+projectId: "motorcyclesaver",
+storageBucket: "motorcyclesaver.firebasestorage.app",
+messagingSenderId: "952927970542",
+appId: "1:952927970542:web:1139f1c9658675ba34bfff",
+measurementId: "G-VK606982DH",
 };
 
-let app: FirebaseApp | null = null;
-let db: Firestore | null = null;
-let initError: string | null = null;
+const app = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
 
-try {
-  // Only initialize if config looks valid
-  if (firebaseConfig.projectId && !firebaseConfig.projectId.includes('YOUR_')) {
-    app = initializeApp(firebaseConfig);
-    db = getFirestore(app);
-  } else {
-    initError = 'Firebase config not set. Edit src/lib/firebase.ts with your config.';
-    console.warn(initError);
-  }
-} catch (error) {
-  initError = error instanceof Error ? error.message : 'Failed to initialize Firebase';
-  console.error('Firebase initialization error:', error);
-}
-
-export { db, initError };
+export const db = getFirestore(app);     // optional (fine to keep)
+export const rtdb = getDatabase(app);    // ✅ this is what HotspotMap uses
+export const initError: string | null = null;
